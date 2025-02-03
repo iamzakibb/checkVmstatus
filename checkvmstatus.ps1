@@ -1,40 +1,57 @@
-# Function to check if the VM is in use
-function Check-VMStatus {
-    param (
-        [string]$ResourceGroupName,
-        [string]$VMName
-    )
-    # Get the power state of the VM
-    $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Status
-    $powerState = $vm.Statuses | Where-Object { $_.Code -like 'PowerState/*' } | Select-Object -ExpandProperty Code
+# Login to Azure
+#Connect-AzAccount
 
-    # Output the power state
-    Write-Output "Current Power State of VM '$VMName': $powerState"
+# Get all VMs in the subscription
+$allVMs = Get-AzVM
 
-    # Return whether the VM is running
-    return $powerState -eq "PowerState/running"
-}
+# Initialize results array
+$results = @()
 
-# Function to shut down the VM if it's not in use
-function Shutdown-VMIfNotInUse {
-    param (
-        [string]$ResourceGroupName,
-        [string]$VMName
-    )
-    # Check the VM status
-    $isRunning = Check-VMStatus -ResourceGroupName $ResourceGroupName -VMName $VMName
+foreach ($vm in $allVMs) {
+    try {
+        Write-Host "Processing VM: $($vm.Name) in Resource Group: $($vm.ResourceGroupName)"
 
-    if (-not $isRunning) {
-        Write-Output "VM '$VMName' is not in use. Initiating shutdown..."
-        Stop-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force
-        Write-Output "VM '$VMName' has been shut down."
-    } else {
-        Write-Output "VM '$VMName' is currently in use and will not be shut down."
+        # Get CPU percentage metric for the past 1 month (grouped by 1 day)
+        $metricData = Get-AzMetric -ResourceId $vm.Id `
+                                   -MetricName "Percentage CPU" `
+                                   -StartTime (Get-Date).AddMonths(-2) `
+                                   -EndTime (Get-Date) `
+                                   -TimeGrain ([TimeSpan]::FromDays(1)) `
+                                   -DetailedOutput
+
+        # Check if there are metrics available
+        if ($metricData.Data -eq $null -or $metricData.Data.Count -eq 0) {
+            Write-Host "No metrics found for VM: $($vm.Name)"
+            continue
+        }
+
+        # Group metric values by day of the week and calculate the average CPU usage
+        $metricsGroupedByDay = $metricData.Data | Group-Object { $_.TimeStamp.DayOfWeek }
+        foreach ($group in $metricsGroupedByDay) {
+            $day = $group.Name
+            $values = $group.Group | Where-Object { $_.Average -ne $null } | Select-Object -ExpandProperty Average
+
+            if ($values -and $values.Count -gt 0) {
+                $averageUsage = ($values | Measure-Object -Sum).Sum / $values.Count
+            } else {
+                $averageUsage = "No Data"
+            }
+
+            # Add to the results
+            $results += [PSCustomObject]@{
+                VMName         = $vm.Name
+                ResourceGroup  = $vm.ResourceGroupName
+                Weekday        = $day
+                AverageUsage   = $averageUsage
+            }
+        }
+    } catch {
+        Write-Host "Error processing VM: $($vm.Name). Details: $_"
     }
 }
 
-# Example usage
-$ResourceGroupName = "YourResourceGroupName"  # Replace with your resource group name
-$VMName = "YourVMName"  # Replace with your VM name
+# Export results to a CSV file
+$reportFilePath = "VM_Weekday_CPU_Usage_Report1.csv"
+$results | Sort-Object VMName, Weekday | Export-Csv -Path $reportFilePath -NoTypeInformation -Force
 
-Shutdown-VMIfNotInUse -ResourceGroupName $ResourceGroupName -VMName $VMName
+Write-Host "Report saved to $reportFilePath"
